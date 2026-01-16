@@ -1,0 +1,15 @@
+services:
+  arr_tag_searcher:
+    build: .
+    container_name: arr_tag_searcher
+    networks:
+      - media
+    env_file:
+      - .env
+    volumes:
+      - ./state:/data/state
+    restart: unless-stopped
+
+networks:
+  media:
+    external: true
