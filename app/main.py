@@ -6,6 +6,7 @@ import time
 import json
 import random
 import logging
+import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -80,6 +81,32 @@ def pick_random(items: List[int], limit: int) -> List[int]:
     return random.sample(items, limit)
 
 
+def _install_global_logging(log_level: str) -> None:
+    # Remove any existing handlers (prevents duplicate output)
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
+    )
+
+    # Route warnings through logging (stdout)
+    logging.captureWarnings(True)
+    warnings.simplefilter("default")
+
+    # Log uncaught exceptions to stdout as well
+    def _excepthook(exc_type, exc, tb):
+        logging.getLogger("arr-tag-searcher").exception(
+            "Uncaught exception", exc_info=(exc_type, exc, tb)
+        )
+
+    sys.excepthook = _excepthook
+
+
 # -----------------------------
 # State store: cooldown + shuffle-bag
 # -----------------------------
@@ -106,12 +133,11 @@ class StateStore:
                 with open(self.state_path, "r", encoding="utf-8") as f:
                     data = json.load(f) or {}
 
-                # Backward compatibility: older files had flat cooldown buckets at top-level
                 if "cooldowns" in data or "shuffle" in data:
                     self.cooldowns = data.get("cooldowns", {}) or {}
                     self.shuffle = data.get("shuffle", {}) or {}
                 else:
-                    # Assume old format: {bucket: {id: ts}, ...}
+                    # Backward compat: old format was just cooldown buckets at top-level
                     self.cooldowns = {
                         k: {str(ik): int(iv) for ik, iv in v.items()}
                         for k, v in (data.items() if isinstance(data, dict) else [])
@@ -119,7 +145,7 @@ class StateStore:
                     }
                     self.shuffle = {}
 
-                # Normalize cooldown types
+                # Normalize cooldowns
                 self.cooldowns = {
                     str(bucket): {str(i): int(ts) for i, ts in m.items()}
                     for bucket, m in (self.cooldowns.items() if isinstance(self.cooldowns, dict) else [])
@@ -213,7 +239,7 @@ class StateStore:
         random.shuffle(new_ids)
         bag.extend(new_ids)
 
-        # If the bag is empty, start a new cycle
+        # If bag empty, start a new cycle
         if not bag:
             bag = list(eligible_set)
             random.shuffle(bag)
@@ -237,7 +263,7 @@ class StateStore:
           - If the front item is not cooled down, rotate it to end and try next.
           - Stops if none are cooled down in a full pass.
 
-        If mark=True, we record the cooldown timestamp when an item is picked.
+        If mark=True, record cooldown timestamp when picked.
         """
         if count <= 0:
             return []
@@ -323,7 +349,7 @@ class ArrClient:
             "X-Api-Key": self.api_key,
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "arr-tag-searcher/2.0",
+            "User-Agent": "arr-tag-searcher/2.1",
         })
 
     def _url(self, path: str) -> str:
@@ -355,7 +381,7 @@ class ArrClient:
 
     def paged_records(self, path: str, page_size: int, max_records: int) -> List[Dict[str, Any]]:
         """
-        Arr wanted endpoints typically respond with:
+        Wanted endpoints typically respond with:
           { page, pageSize, totalRecords, records: [...] }
         """
         out: List[Dict[str, Any]] = []
@@ -395,7 +421,6 @@ class Limits:
     radarr_upgrades: int
     lidarr_missing: int
     lidarr_upgrades: int
-
     sonarr_promote: int
     radarr_promote: int
     lidarr_promote: int
@@ -557,7 +582,6 @@ def sonarr_run_once(
     series = client.get_json("/series")
     series_tags = build_id_to_tags(series, "id")
 
-    # Missing by tag=search
     if search_tag_id is not None and limits.sonarr_missing > 0:
         missing = client.paged_records("/wanted/missing", page_size=wanted_page_size, max_records=0)
         missing_series_ids = sorted({extract_id(r, "seriesId") for r in missing if extract_id(r, "seriesId") is not None})
@@ -581,7 +605,6 @@ def sonarr_run_once(
                 client.post_json("/command", payload)
                 log.info("Sonarr: triggered SeriesSearch for seriesId=%d", sid)
 
-    # Upgrades by tag=done
     if done_tag_id is not None and limits.sonarr_upgrades > 0:
         cutoff = client.paged_records("/wanted/cutoff", page_size=wanted_page_size, max_records=0)
         cutoff_series_ids = sorted({extract_id(r, "seriesId") for r in cutoff if extract_id(r, "seriesId") is not None})
@@ -627,7 +650,6 @@ def radarr_run_once(
     movies = client.get_json("/movie")
     movie_tags = build_id_to_tags(movies, "id")
 
-    # Missing by tag=search
     if search_tag_id is not None and limits.radarr_missing > 0:
         missing = client.paged_records("/wanted/missing", page_size=wanted_page_size, max_records=0)
         missing_movie_ids = sorted({extract_id(r, "movieId", "movie") for r in missing if extract_id(r, "movieId", "movie") is not None})
@@ -651,7 +673,6 @@ def radarr_run_once(
                 client.post_json("/command", payload)
                 log.info("Radarr: triggered MoviesSearch for movieIds=%s", picked)
 
-    # Upgrades by tag=done
     if done_tag_id is not None and limits.radarr_upgrades > 0:
         cutoff = client.paged_records("/wanted/cutoff", page_size=wanted_page_size, max_records=0)
         cutoff_movie_ids = sorted({extract_id(r, "movieId", "movie") for r in cutoff if extract_id(r, "movieId", "movie") is not None})
@@ -697,7 +718,6 @@ def lidarr_run_once(
     artists = client.get_json("/artist")
     artist_tags = build_id_to_tags(artists, "id")
 
-    # Missing by tag=search
     if search_tag_id is not None and limits.lidarr_missing > 0:
         missing = client.paged_records("/wanted/missing", page_size=wanted_page_size, max_records=0)
         missing_artist_ids = sorted({extract_id(r, "artistId", "artist") for r in missing if extract_id(r, "artistId", "artist") is not None})
@@ -721,7 +741,6 @@ def lidarr_run_once(
                 client.post_json("/command", payload)
                 log.info("Lidarr: triggered ArtistSearch for artistId=%d", aid)
 
-    # Upgrades by tag=done
     if done_tag_id is not None and limits.lidarr_upgrades > 0:
         cutoff = client.paged_records("/wanted/cutoff", page_size=wanted_page_size, max_records=0)
         cutoff_artist_ids = sorted({extract_id(r, "artistId", "artist") for r in cutoff if extract_id(r, "artistId", "artist") is not None})
@@ -751,11 +770,7 @@ def lidarr_run_once(
 # -----------------------------
 def main() -> None:
     log_level = env("LOG_LEVEL", "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, log_level, logging.INFO),
-        format="%(asctime)s %(levelname)s %(message)s",
-        stream=sys.stdout,
-    )
+    _install_global_logging(log_level)
     log = logging.getLogger("arr-tag-searcher")
 
     seed = os.getenv("RANDOM_SEED")
@@ -770,22 +785,18 @@ def main() -> None:
     timeout_s = env_int("HTTP_TIMEOUT_SECONDS", 30)
     dry_run = env_bool("DRY_RUN", False)
 
-    # State
     state_dir = env("STATE_DIR", "/data/state")
     ensure_dir(state_dir)
     state_path = os.path.join(state_dir, "state.json")
     state = StateStore(state_path, log)
 
     default_cooldown_s = max(0, env_int("DEFAULT_COOLDOWN_HOURS", 0)) * 3600
-
     auto_promote = env_bool("AUTO_PROMOTE_SEARCH_TO_DONE", True)
 
-    # Apps
     sonarr = AppConfig(enabled=env_bool("SONARR_ENABLED", True), url=env("SONARR_URL", ""), api_key=env("SONARR_API_KEY", ""))
     radarr = AppConfig(enabled=env_bool("RADARR_ENABLED", True), url=env("RADARR_URL", ""), api_key=env("RADARR_API_KEY", ""))
     lidarr = AppConfig(enabled=env_bool("LIDARR_ENABLED", True), url=env("LIDARR_URL", ""), api_key=env("LIDARR_API_KEY", ""))
 
-    # Limits
     limits = Limits(
         sonarr_missing=env_int("SONARR_MISSING_LIMIT", 10),
         sonarr_upgrades=env_int("SONARR_UPGRADES_LIMIT", 10),
